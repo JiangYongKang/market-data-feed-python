@@ -61,6 +61,20 @@ class DeliveryKind(str, Enum):
     SUBSCRIPTION = "subscription"
     DROPPED = "dropped"
     COALESCED = "coalesced"
+    HISTORY_BOUNDARY = "history_boundary"
+
+
+class HistoryJoinStatus(str, Enum):
+    """Outcome of a snapshot/resume request at subscription time."""
+
+    SNAPSHOT_READY = "snapshot_ready"
+    RESUME_READY = "resume_ready"
+    GAP_PENDING = "gap_pending"
+    UNRECOVERABLE_GAP = "unrecoverable_gap"
+    CHECKPOINT_TOO_OLD = "checkpoint_too_old"
+    CHECKPOINT_AHEAD = "checkpoint_ahead"
+    ALREADY_SUBSCRIBED = "already_subscribed"
+    REJECTED = "rejected"
 
 
 class IngestStatus(str, Enum):

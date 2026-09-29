@@ -113,6 +113,10 @@ class SubscriptionRegistry:
     def is_known_key(self, key: SubscriptionKey) -> bool:
         return key.source in self._known_symbols and key.symbol in self._known_symbols[key.source]
 
+    def is_subscribed(self, subscriber_id: str, key: SubscriptionKey) -> bool:
+        with self._lock:
+            return key in self._subscriber_keys.get(subscriber_id, set())
+
     def validation_error_kind(self, key: SubscriptionKey) -> SubscriptionErrorKind | None:
         if key.source not in self._known_symbols:
             return SubscriptionErrorKind.UNKNOWN_SOURCE

@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 
 from .enums import SourceId
-from .models import SubscriberOptions
+from .models import ProgressMarker, SubscriberOptions
 from .schemas import IngestRequest, ReconnectRequest, SubscribeRequest, UnsubscribeRequest
 from .service import MarketDataFeedService
 
@@ -65,9 +65,55 @@ def create_app(service: MarketDataFeedService | None = None) -> FastAPI:
     async def queues() -> dict[str, int]:
         return feed.dispatcher.queue_snapshot()
 
+    @app.get("/state/history")
+    async def history_state() -> dict[str, Any]:
+        return {
+            f"{key.source.value}/{key.symbol}": {
+                "retained": stats.retained,
+                "capacity": stats.capacity,
+                "oldest_sequence": stats.oldest_sequence,
+                "newest_sequence": stats.newest_sequence,
+                "oldest_event_time": _jsonable(stats.oldest_event_time),
+                "newest_event_time": _jsonable(stats.newest_event_time),
+                "total_evicted": stats.total_evicted,
+                "last_evicted_sequence": stats.last_evicted_sequence,
+                "continuity_reset": stats.continuity_reset,
+                "gap_state": stats.gap_state.value,
+                "detail": stats.detail,
+            }
+            for key, stats in feed.history_stats().items()
+        }
+
     @app.post("/subscriptions")
     async def subscribe(request: SubscribeRequest):
         options = SubscriberOptions(queue_size=request.queue_size, backpressure=request.backpressure)
+        if request.with_history or request.after_sequence is not None:
+            checkpoint = (
+                ProgressMarker(request.source, request.symbol, request.after_sequence)
+                if request.after_sequence is not None
+                else None
+            )
+            result = await feed.subscribe_with_history(
+                request.subscriber_id,
+                request.source,
+                request.symbol,
+                options,
+                checkpoint=checkpoint,
+                snapshot_limit=request.snapshot_limit,
+                wait_for_gap=request.wait_for_gap,
+                gap_wait_timeout=request.gap_wait_timeout,
+            )
+            return {
+                "ok": result.subscription.ok,
+                "changed": result.subscription.changed,
+                "detail": result.detail,
+                "kind": result.subscription.kind.value if result.subscription.kind else None,
+                "join_status": result.status.value,
+                "incomplete": result.incomplete,
+                "last_sequence": result.last_sequence,
+                "expected_sequence": result.expected_sequence,
+                "quotes": [_jsonable(quote) for quote in result.quotes],
+            }
         result = await feed.subscribe(
             request.subscriber_id,
             request.source,

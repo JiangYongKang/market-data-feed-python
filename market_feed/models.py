@@ -7,6 +7,7 @@ from .enums import (
     BackpressurePolicy,
     DeliveryKind,
     GapState,
+    HistoryJoinStatus,
     IngestStatus,
     RecordDisposition,
     RejectReason,
@@ -120,3 +121,74 @@ class SubscriberOptions:
     queue_size: int = 8
     backpressure: BackpressurePolicy = BackpressurePolicy.BLOCK
     slow_callback_delay: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressMarker:
+    """A consumer-side checkpoint: the last sequence already processed."""
+
+    source: SourceId
+    symbol: str
+    sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryRetention:
+    """Bounded retention policy for one (source, symbol) history window.
+
+    ``max_quotes`` is the hard per-key count limit; ``max_age_seconds`` is an
+    optional time-based limit evaluated against event_time.
+    """
+
+    max_quotes: int = 64
+    max_age_seconds: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class KeyHistoryStats:
+    """Observable retention state for one (source, symbol) history window."""
+
+    key: SubscriptionKey
+    retained: int
+    capacity: int
+    oldest_sequence: int | None
+    newest_sequence: int | None
+    oldest_event_time: datetime | None
+    newest_event_time: datetime | None
+    total_evicted: int
+    last_evicted_sequence: int | None
+    continuity_reset: bool
+    gap_state: GapState
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryBoundary:
+    """Marker payload separating an out-of-band history window from live flow.
+
+    The live stream starts strictly after ``last_sequence``; no quote at or
+    below that sequence will ever be delivered live to this subscriber.
+    """
+
+    source: SourceId
+    symbol: str
+    status: HistoryJoinStatus
+    last_sequence: int | None
+    quote_count: int
+    checkpoint_sequence: int | None
+    incomplete: bool
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class HistorySubscriptionResult:
+    """Result of subscribe_with_history: subscription state plus snapshot."""
+
+    subscription: SubscriptionResult
+    status: HistoryJoinStatus
+    key: SubscriptionKey | None
+    quotes: tuple[Quote, ...]
+    last_sequence: int | None
+    expected_sequence: int | None
+    incomplete: bool
+    detail: str

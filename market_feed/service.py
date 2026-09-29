@@ -11,6 +11,7 @@ from .enums import (
     BackpressurePolicy,
     DeliveryKind,
     GapState,
+    HistoryJoinStatus,
     IngestStatus,
     RecordDisposition,
     RejectReason,
@@ -21,7 +22,12 @@ from .logging_utils import configure_logging, event_log
 from .models import (
     DeliveryEvent,
     GapEvent,
+    HistoryBoundary,
+    HistoryRetention,
+    HistorySubscriptionResult,
     IngestResult,
+    KeyHistoryStats,
+    ProgressMarker,
     Quote,
     RejectedRecord,
     SequenceState,
@@ -29,6 +35,7 @@ from .models import (
     SubscriptionResult,
     SubscriberOptions,
 )
+from .history import HistoryStore
 from .normalization import NormalizationRouter
 from .sequence import SequenceTracker
 from .subscriptions import SubscriptionRegistry
@@ -57,13 +64,18 @@ class MarketDataFeedService:
         self,
         known_symbols: dict[SourceId, frozenset[str]] | None = None,
         max_recoverable_gap: int = 8,
+        history_retention: HistoryRetention | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.registry = SubscriptionRegistry(known_symbols)
         self.router = NormalizationRouter()
         self.dispatcher = Dispatcher(logger or configure_logging())
+        self.history = HistoryStore(history_retention)
         self._trackers: dict[SubscriptionKey, SequenceTracker] = {}
-        self._key_locks: dict[SubscriptionKey, asyncio.Lock] = {}
+        # The per-key condition also serializes state transitions for a key:
+        # ingests acquire it as the "key lock", and snapshot/resume requests
+        # can wait on it for an in-flight recoverable gap to resolve.
+        self._key_locks: dict[SubscriptionKey, asyncio.Condition] = {}
         self._source_locks: dict[SourceId, asyncio.Lock] = {
             SourceId.SOURCE_A: asyncio.Lock(),
             SourceId.SOURCE_B: asyncio.Lock(),
@@ -83,12 +95,15 @@ class MarketDataFeedService:
         return tracker
 
 
-    def _key_lock(self, key: SubscriptionKey) -> asyncio.Lock:
+    def _key_lock(self, key: SubscriptionKey) -> asyncio.Condition:
         lock = self._key_locks.get(key)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = asyncio.Condition()
             self._key_locks[key] = lock
         return lock
+
+    def history_stats(self) -> dict[SubscriptionKey, KeyHistoryStats]:
+        return self.history.all_stats()
 
     def sequence_snapshot(self, key: SubscriptionKey) -> SequenceState | None:
         tracker = self._trackers.get(key)
@@ -183,6 +198,308 @@ class MarketDataFeedService:
             detail=result.detail,
         )
         return result
+
+    async def subscribe_with_history(
+        self,
+        subscriber_id: str,
+        source: SourceId,
+        symbol: str,
+        options: SubscriberOptions | None = None,
+        *,
+        checkpoint: ProgressMarker | None = None,
+        snapshot_limit: int | None = None,
+        wait_for_gap: bool = True,
+        gap_wait_timeout: float = 5.0,
+    ) -> HistorySubscriptionResult:
+        """Subscribe with a bounded history snapshot or a checkpoint resume.
+
+        - Without ``checkpoint``: attach the latest confirmed snapshot.
+        - With ``checkpoint``: replay only the confirmed quotes strictly after
+          the checkpoint, then continue live.
+        - When the key is mid recovery the call waits for the gap to resolve so
+          the returned window is contiguous end-to-end; on timeout it reports
+          ``gap_pending`` without registering the subscription.
+        - An unrecoverable gap or an out-of-range checkpoint is reported with
+          an explicit status instead of silently splicing a discontinuous flow.
+
+        The snapshot is returned out-of-band in the result; the live queue
+        receives exactly one HISTORY_BOUNDARY marker, after which only live
+        quotes above the snapshot watermark are delivered.
+        """
+        key = SubscriptionKey(source=source, symbol=symbol)
+
+        if not isinstance(subscriber_id, str) or not subscriber_id.strip():
+            rejected = SubscriptionResult(
+                ok=False,
+                subscriber_id=subscriber_id if isinstance(subscriber_id, str) else "",
+                key=None,
+                kind=SubscriptionErrorKind.INVALID_SUBSCRIBER,
+                detail="subscription rejected: invalid subscriber_id",
+                changed=False,
+            )
+            return self._history_result(rejected, HistoryJoinStatus.REJECTED, None, (), None, None, True, rejected.detail)
+
+        validation_kind = self.registry.validation_error_kind(key)
+        if validation_kind is not None:
+            rejected = SubscriptionResult(
+                ok=False,
+                subscriber_id=subscriber_id,
+                key=key,
+                kind=validation_kind,
+                detail=f"subscription rejected: {validation_kind.value}",
+                changed=False,
+            )
+            return self._history_result(rejected, HistoryJoinStatus.REJECTED, key, (), None, None, True, rejected.detail)
+
+        if checkpoint is not None and (checkpoint.source != source or checkpoint.symbol != symbol):
+            rejected = SubscriptionResult(
+                ok=False,
+                subscriber_id=subscriber_id,
+                key=key,
+                kind=None,
+                detail="checkpoint does not match the requested source/symbol",
+                changed=False,
+            )
+            return self._history_result(rejected, HistoryJoinStatus.REJECTED, key, (), None, None, True, rejected.detail)
+        if checkpoint is not None and checkpoint.sequence < 0:
+            rejected = SubscriptionResult(
+                ok=False,
+                subscriber_id=subscriber_id,
+                key=key,
+                kind=None,
+                detail="checkpoint sequence must be non-negative",
+                changed=False,
+            )
+            return self._history_result(rejected, HistoryJoinStatus.REJECTED, key, (), None, None, True, rejected.detail)
+        if snapshot_limit is not None and snapshot_limit < 1:
+            raise ValueError("snapshot_limit must be at least 1")
+
+        deadline = asyncio.get_running_loop().time() + gap_wait_timeout
+
+        # All per-key state (tracker, history, subscriber index reads during
+        # publish) is mutated while holding this condition, so check, wait and
+        # finalize are atomic w.r.t. per-key ingests without taking the source
+        # lock; waiting here never blocks a different key's writers.
+        condition = self._key_lock(key)
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            async with condition:
+                tracker = self._trackers.get(key)
+                state = tracker.snapshot() if tracker is not None else None
+                gap_state = self.history.gap_state(key)
+
+                if gap_state is GapState.UNRECOVERABLE:
+                    detail = "feed is behind an unrecoverable gap; pull a fresh snapshot after explicit resume"
+                    result = self._history_result(
+                        self._unchanged(subscriber_id, key),
+                        HistoryJoinStatus.UNRECOVERABLE_GAP,
+                        key, (),
+                        state.last_sequence if state else None,
+                        state.expected_sequence if state else None,
+                        True, detail,
+                    )
+                    event_log(self._logger, "history_subscription", subscriber_id=subscriber_id, key=key, status=result.status.value, detail=detail)
+                    return result
+
+                if gap_state is GapState.RECOVERING and wait_for_gap and remaining > 0:
+                    try:
+                        await asyncio.wait_for(condition.wait(), timeout=remaining)
+                    except TimeoutError:
+                        pass
+                    continue
+
+                if gap_state is GapState.RECOVERING:
+                    pending = self._pending_result(subscriber_id, key, state)
+                    event_log(self._logger, "history_subscription", subscriber_id=subscriber_id, key=key, status=pending.status.value, detail=pending.detail)
+                    return pending
+
+                return await self._finalize_history_subscription(
+                    subscriber_id=subscriber_id,
+                    key=key,
+                    options=options,
+                    checkpoint=checkpoint,
+                    snapshot_limit=snapshot_limit,
+                    state=state,
+                )
+
+    def _history_result(
+        self,
+        subscription: SubscriptionResult,
+        status: HistoryJoinStatus,
+        key: SubscriptionKey | None,
+        quotes: tuple[Quote, ...],
+        last_sequence: int | None,
+        expected_sequence: int | None,
+        incomplete: bool,
+        detail: str,
+    ) -> HistorySubscriptionResult:
+        return HistorySubscriptionResult(
+            subscription=subscription,
+            status=status,
+            key=key,
+            quotes=quotes,
+            last_sequence=last_sequence,
+            expected_sequence=expected_sequence,
+            incomplete=incomplete,
+            detail=detail,
+        )
+
+    def _unchanged(self, subscriber_id: str, key: SubscriptionKey) -> SubscriptionResult:
+        return SubscriptionResult(
+            ok=True,
+            subscriber_id=subscriber_id,
+            key=key,
+            kind=None,
+            detail="no subscription change",
+            changed=False,
+        )
+
+    def _pending_result(self, subscriber_id: str, key: SubscriptionKey, state: SequenceState | None) -> HistorySubscriptionResult:
+        partial = self.history.snapshot(key)
+        detail = (
+            "a recoverable gap is still open; the partial window ends at "
+            f"sequence {partial[-1].sequence if partial else None}; retry later or subscribe without history"
+        )
+        return self._history_result(
+            self._unchanged(subscriber_id, key),
+            HistoryJoinStatus.GAP_PENDING,
+            key,
+            partial,
+            state.last_sequence if state else None,
+            state.expected_sequence if state else None,
+            True,
+            detail,
+        )
+
+    async def _finalize_history_subscription(
+        self,
+        *,
+        subscriber_id: str,
+        key: SubscriptionKey,
+        options: SubscriberOptions | None,
+        checkpoint: ProgressMarker | None,
+        snapshot_limit: int | None,
+        state: SequenceState | None,
+    ) -> HistorySubscriptionResult:
+        """Run with both the source lock and the key condition held."""
+        last_sequence = state.last_sequence if state else None
+        expected_sequence = state.expected_sequence if state else None
+
+        if self.registry.is_subscribed(subscriber_id, key):
+            result = self._history_result(
+                SubscriptionResult(
+                    ok=True, subscriber_id=subscriber_id, key=key, kind=None,
+                    detail="subscription already exists; no snapshot is re-sent",
+                    changed=False,
+                ),
+                HistoryJoinStatus.ALREADY_SUBSCRIBED,
+                key, (), last_sequence, expected_sequence, False,
+                "subscriber already holds this subscription; resend requires unsubscribe first",
+            )
+            event_log(self._logger, "history_subscription", subscriber_id=subscriber_id, key=key, status=result.status.value)
+            return result
+
+        if checkpoint is not None:
+            status, quotes, detail = self._resume_window(key, checkpoint.sequence, state)
+            incomplete = status is not HistoryJoinStatus.RESUME_READY
+        else:
+            quotes = self.history.snapshot(key, limit=snapshot_limit)
+            status = HistoryJoinStatus.SNAPSHOT_READY
+            detail = f"snapshot of {len(quotes)} confirmed quote(s)"
+            incomplete = False
+
+        if status in (HistoryJoinStatus.CHECKPOINT_TOO_OLD, HistoryJoinStatus.CHECKPOINT_AHEAD):
+            result = self._history_result(
+                self._unchanged(subscriber_id, key),
+                status, key, (), last_sequence, expected_sequence, True, detail,
+            )
+            event_log(self._logger, "history_subscription", subscriber_id=subscriber_id, key=key, status=status.value, detail=detail)
+            return result
+
+        watermark = quotes[-1].sequence if quotes else (checkpoint.sequence if checkpoint is not None else last_sequence)
+
+        actual_options = await self.dispatcher.add_subscriber(subscriber_id, options)
+        subscription = self.registry.subscribe(subscriber_id, key)
+        assert subscription.ok and subscription.changed
+
+        boundary = HistoryBoundary(
+            source=key.source,
+            symbol=key.symbol,
+            status=status,
+            last_sequence=watermark,
+            quote_count=len(quotes),
+            checkpoint_sequence=checkpoint.sequence if checkpoint is not None else None,
+            incomplete=False,
+            detail=detail,
+        )
+        # The boundary belongs only to the newly joining subscriber; existing
+        # subscribers must keep receiving a plain live stream.
+        audits = await self.dispatcher.publish(
+            [subscriber_id],
+            self._delivery(DeliveryKind.HISTORY_BOUNDARY, boundary),
+        )
+        for audit in audits:
+            event_log(self._logger, "backpressure_decision", audit=audit, key=key)
+        result = self._history_result(
+            subscription, status, key, quotes, watermark, expected_sequence, False, detail,
+        )
+        event_log(
+            self._logger,
+            "history_subscription",
+            subscriber_id=subscriber_id,
+            key=key,
+            status=status.value,
+            quote_count=len(quotes),
+            watermark=watermark,
+            queue_size=actual_options.queue_size,
+            backpressure=actual_options.backpressure,
+        )
+        return result
+
+    def _resume_window(
+        self,
+        key: SubscriptionKey,
+        checkpoint: int,
+        state: SequenceState | None,
+    ) -> tuple[HistoryJoinStatus, tuple[Quote, ...], str]:
+        last_sequence = state.last_sequence if state else None
+        if last_sequence is None:
+            return (
+                HistoryJoinStatus.CHECKPOINT_AHEAD,
+                (),
+                f"checkpoint {checkpoint} is ahead: no confirmed quote exists yet",
+            )
+        if checkpoint > last_sequence:
+            return (
+                HistoryJoinStatus.CHECKPOINT_AHEAD,
+                (),
+                f"checkpoint {checkpoint} is ahead of the latest confirmed sequence {last_sequence}",
+            )
+        oldest = self.history.oldest_sequence(key)
+        if oldest is None:
+            # An empty window is only resumable when the checkpoint sits exactly
+            # on the current baseline (e.g. right after an explicit resume);
+            # there is nothing to backfill and live flow continues.
+            if checkpoint == last_sequence:
+                return HistoryJoinStatus.RESUME_READY, (), f"resume at baseline {checkpoint}: no backlog"
+            return (
+                HistoryJoinStatus.CHECKPOINT_TOO_OLD,
+                (),
+                f"checkpoint {checkpoint} is outside the bounded window (no retained history); pull a fresh snapshot",
+            )
+        # checkpoint == oldest - 1 can still be backfilled by the full window.
+        if checkpoint + 1 < oldest:
+            return (
+                HistoryJoinStatus.CHECKPOINT_TOO_OLD,
+                (),
+                f"checkpoint {checkpoint} is outside the bounded window (oldest retained sequence is {oldest}); pull a fresh snapshot",
+            )
+        quotes = self.history.snapshot(key, after_sequence=checkpoint)
+        return (
+            HistoryJoinStatus.RESUME_READY,
+            quotes,
+            f"resume after sequence {checkpoint}: {len(quotes)} backlog quote(s) confirmed",
+        )
 
     def _delivery(
         self,
@@ -295,6 +612,28 @@ class MarketDataFeedService:
                 state=state,
             )
 
+            # Keep the bounded history window in sync with what the sequence
+            # state machine actually released: only fully validated quotes
+            # (normal or recovered) are retained; buffered, stale, out-of-order
+            # and unrecoverable-gap quotes never enter history.
+            history_evicted: list[int] = []
+            if decision.release:
+                history_evicted = self.history.append(key, decision.release)
+                if history_evicted:
+                    event_log(
+                        self._logger,
+                        "history_eviction",
+                        key=key,
+                        evicted_sequences=tuple(history_evicted),
+                        retained=self.history.stats(key).retained,
+                    )
+            if decision.disposition is RecordDisposition.GAP_UNRECOVERABLE:
+                self.history.mark_gap_state(key, GapState.UNRECOVERABLE)
+            elif state.state is GapState.RECOVERING:
+                self.history.mark_gap_state(key, GapState.RECOVERING)
+            elif state.state is GapState.NORMAL:
+                self.history.mark_gap_state(key, GapState.NORMAL)
+
             # Release recovered quotes before the gap-resolved marker.
             # Initial or extended gap markers precede future buffered quotes,
             # and those future quotes are not released at this point.
@@ -306,6 +645,10 @@ class MarketDataFeedService:
                         self._delivery(kind, released, released.received_time),
                     )
             await self._publish_gaps(key, decision.gap_events)
+            # Wake snapshot/resume waiters after state and history are updated
+            # and the live events are enqueued. The key condition is already
+            # held here; notify_all requires the lock and must not re-acquire it.
+            self._key_locks[key].notify_all()
 
             return IngestResult(
                 status=status,
@@ -337,6 +680,21 @@ class MarketDataFeedService:
             async with self._key_lock(key):
                 tracker = self._tracker(key)
                 tracker.reset(sequence, event_time)
+                # Pre-gap history can never be presented next to the new
+                # baseline; discard it instead of splicing across the hole.
+                evicted = self.history.reset_continuity(
+                    key,
+                    detail="operator explicitly resumed after an unrecoverable gap",
+                )
+                if evicted:
+                    event_log(
+                        self._logger,
+                        "history_eviction",
+                        key=key,
+                        evicted_sequences=tuple(evicted),
+                        retained=0,
+                        reason="unrecoverable gap resume",
+                    )
                 event_log(self._logger, "explicit_gap_resume", key=key, sequence=sequence, event_time=event_time)
                 await self._publish_gaps(
                     key,
@@ -353,6 +711,7 @@ class MarketDataFeedService:
                         ),
                     ),
                 )
+                self._key_lock(key).notify_all()
                 state = tracker.snapshot()
                 return IngestResult(
                     status=IngestStatus.RECOVERED,
