@@ -11,6 +11,7 @@ from .enums import (
     BackpressurePolicy,
     DeliveryKind,
     GapState,
+    HandoffMode,
     IngestStatus,
     RecordDisposition,
     RejectReason,
@@ -21,9 +22,12 @@ from .logging_utils import configure_logging, event_log
 from .models import (
     DeliveryEvent,
     GapEvent,
+    HandoffEnvelope,
+    HistoryStats,
     IngestResult,
     Quote,
     RejectedRecord,
+    ResumePosition,
     SequenceState,
     SubscriptionKey,
     SubscriptionResult,
@@ -33,6 +37,7 @@ from .normalization import NormalizationRouter
 from .sequence import SequenceTracker
 from .subscriptions import SubscriptionRegistry
 from .dispatcher import Dispatcher
+from .history import HistoryStore
 from .sources import ScriptedSource
 
 
@@ -57,11 +62,13 @@ class MarketDataFeedService:
         self,
         known_symbols: dict[SourceId, frozenset[str]] | None = None,
         max_recoverable_gap: int = 8,
+        history_capacity_per_key: int = 64,
         logger: logging.Logger | None = None,
     ) -> None:
         self.registry = SubscriptionRegistry(known_symbols)
         self.router = NormalizationRouter()
         self.dispatcher = Dispatcher(logger or configure_logging())
+        self.history = HistoryStore(history_capacity_per_key)
         self._trackers: dict[SubscriptionKey, SequenceTracker] = {}
         self._key_locks: dict[SubscriptionKey, asyncio.Lock] = {}
         self._source_locks: dict[SourceId, asyncio.Lock] = {
@@ -115,6 +122,11 @@ class MarketDataFeedService:
         source: SourceId,
         symbol: str,
         options: SubscriberOptions | None = None,
+        *,
+        snapshot: int | None = None,
+        resume_from: ResumePosition | None = None,
+        wait_for_consistency: bool = False,
+        consistency_timeout: float = 2.0,
     ) -> SubscriptionResult:
         if not isinstance(subscriber_id, str) or not subscriber_id.strip():
             result = SubscriptionResult(
@@ -151,23 +163,196 @@ class MarketDataFeedService:
             )
             return result
 
-        # Create delivery capacity only after key validation succeeds. Existing
-        # subscribers retain their configured queue and backpressure policy.
-        actual_options = await self.dispatcher.add_subscriber(subscriber_id, options)
-        result = self.registry.subscribe(subscriber_id, key)
-        event_log(
-            self._logger,
-            "subscription_request",
-            subscriber_id=subscriber_id,
-            source=source,
-            symbol=symbol,
-            ok=result.ok,
-            changed=result.changed,
-            detail=result.detail,
-            queue_size=actual_options.queue_size,
-            backpressure=actual_options.backpressure,
-        )
-        return result
+        wants_handoff = snapshot is not None or resume_from is not None
+        if resume_from is not None and resume_from.sequence < 0:
+            return SubscriptionResult(
+                ok=False,
+                subscriber_id=subscriber_id,
+                key=key,
+                kind=SubscriptionErrorKind.RESUME_POSITION_EVICTED,
+                detail="resume rejected: sequence must be non-negative",
+                changed=False,
+            )
+        if snapshot is not None and snapshot < 1:
+            return SubscriptionResult(
+                ok=False,
+                subscriber_id=subscriber_id,
+                key=key,
+                kind=SubscriptionErrorKind.SNAPSHOT_INCOMPLETE,
+                detail="snapshot rejected: limit must be at least 1",
+                changed=False,
+            )
+
+        # Optionally wait for an in-flight recoverable gap to close before
+        # taking the consistent-view decision. Poll without holding the key
+        # lock so normal ingest/recovery is never blocked.
+        if wait_for_consistency:
+            deadline = asyncio.get_running_loop().time() + max(consistency_timeout, 0.0)
+            while True:
+                state = self.sequence_snapshot(key)
+                if state is None or state.state is not GapState.RECOVERING:
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.005)
+
+        # The whole register-and-handoff transition is atomic with respect to
+        # ingest for this key: no live release can appear between choosing the
+        # historical slice and enqueueing it ahead of the live stream.
+        async with self._key_lock(key):
+            if wants_handoff and subscriber_id in self.registry.subscribers_for(key):
+                result = SubscriptionResult(
+                    ok=False,
+                    subscriber_id=subscriber_id,
+                    key=key,
+                    kind=SubscriptionErrorKind.ALREADY_SUBSCRIBED,
+                    detail=(
+                        "handoff rejected: subscriber already holds this subscription; "
+                        "unsubscribe before requesting a new snapshot/resume"
+                    ),
+                    changed=False,
+                )
+                event_log(self._logger, "subscription_request", subscriber_id=subscriber_id, source=source, symbol=symbol, ok=False, changed=False, detail=result.detail)
+                return result
+
+            state = self.sequence_snapshot(key)
+            if state is not None and state.state is not GapState.NORMAL:
+                kind = (
+                    SubscriptionErrorKind.SNAPSHOT_INCOMPLETE
+                    if state.state is GapState.RECOVERING
+                    else SubscriptionErrorKind.RESUME_BARRIER_PRESENT
+                )
+                detail = (
+                    f"handoff rejected: {key.source.value}/{key.symbol} is {state.state.value} "
+                    f"for sequences {state.missing_from}..{state.missing_to}; "
+                    "retry after recovery or realign with resume_after_gap + snapshot"
+                )
+                result = SubscriptionResult(
+                    ok=False,
+                    subscriber_id=subscriber_id,
+                    key=key,
+                    kind=kind,
+                    detail=detail,
+                    changed=False,
+                )
+                event_log(self._logger, "subscription_request", subscriber_id=subscriber_id, source=source, symbol=symbol, ok=False, changed=False, detail=detail)
+                return result
+
+            mode = HandoffMode.RESUME if resume_from is not None else HandoffMode.SNAPSHOT
+            replay: tuple[Quote, ...] = ()
+            checkpoint: int | None = None
+            if wants_handoff:
+                if resume_from is not None:
+                    if resume_from.source is not source or resume_from.symbol != symbol:
+                        return SubscriptionResult(
+                            ok=False,
+                            subscriber_id=subscriber_id,
+                            key=key,
+                            kind=SubscriptionErrorKind.RESUME_POSITION_EVICTED,
+                            detail="resume rejected: checkpoint does not match the subscribed source/symbol",
+                            changed=False,
+                        )
+                    checkpoint = resume_from.sequence
+                    replay_or_error = self.history.replay_after(key, checkpoint)
+                    if isinstance(replay_or_error, SubscriptionErrorKind):
+                        detail_map = {
+                            SubscriptionErrorKind.RESUME_POSITION_EVICTED: (
+                                "resume rejected: checkpoint is older than retained history; "
+                                "realign by pulling a fresh snapshot"
+                            ),
+                            SubscriptionErrorKind.RESUME_POSITION_AHEAD: (
+                                "resume rejected: checkpoint is ahead of retained history; "
+                                "realign by pulling a fresh snapshot"
+                            ),
+                            SubscriptionErrorKind.RESUME_BARRIER_PRESENT: (
+                                "resume rejected: an unrecoverable gap lies between checkpoint and "
+                                "current data; realign by pulling a fresh snapshot"
+                            ),
+                        }
+                        result = SubscriptionResult(
+                            ok=False,
+                            subscriber_id=subscriber_id,
+                            key=key,
+                            kind=replay_or_error,
+                            detail=detail_map[replay_or_error],
+                            changed=False,
+                        )
+                        event_log(self._logger, "subscription_request", subscriber_id=subscriber_id, source=source, symbol=symbol, ok=False, changed=False, detail=result.detail, checkpoint=checkpoint)
+                        return result
+                    replay = replay_or_error
+                else:
+                    replay = self.history.snapshot_tail(key, snapshot)
+
+            # Create delivery capacity only after key validation succeeds. Existing
+            # subscribers retain their configured queue and backpressure policy.
+            actual_options = await self.dispatcher.add_subscriber(subscriber_id, options)
+            result = self.registry.subscribe(subscriber_id, key)
+
+            envelope: HandoffEnvelope | None = None
+            if wants_handoff:
+                stats = self.history.stats(key)
+                if replay:
+                    live_from = replay[-1].sequence + 1
+                elif resume_from is not None:
+                    live_from = resume_from.sequence + 1
+                elif state is not None and state.expected_sequence is not None:
+                    live_from = state.expected_sequence
+                else:
+                    live_from = None
+                envelope = HandoffEnvelope(
+                    mode=mode,
+                    key=key,
+                    quotes=replay,
+                    resume_from_sequence=checkpoint,
+                    live_from_sequence=live_from,
+                    complete=True,
+                    stats=stats,
+                    detail="historical view delivered ahead of the live stream",
+                )
+                event = self._delivery(DeliveryKind.HANDOFF, envelope)
+                audits = await self.dispatcher.begin_handoff(subscriber_id, [event])
+                for audit in audits:
+                    event_log(self._logger, "backpressure_decision", audit=audit, key=key, handoff=True)
+                event_log(
+                    self._logger,
+                    "handoff_delivered",
+                    subscriber_id=subscriber_id,
+                    key=key,
+                    mode=mode.value,
+                    quotes=len(replay),
+                    checkpoint=checkpoint,
+                    live_from=live_from,
+                )
+
+            event_log(
+                self._logger,
+                "subscription_request",
+                subscriber_id=subscriber_id,
+                source=source,
+                symbol=symbol,
+                ok=result.ok,
+                changed=result.changed,
+                detail=result.detail,
+                queue_size=actual_options.queue_size,
+                backpressure=actual_options.backpressure,
+                handoff=mode.value if wants_handoff else None,
+            )
+            return SubscriptionResult(
+                ok=result.ok,
+                subscriber_id=result.subscriber_id,
+                key=result.key,
+                kind=result.kind,
+                detail=result.detail,
+                changed=result.changed,
+                handoff=envelope,
+            )
+
+    def history_stats(self, source: SourceId, symbol: str) -> HistoryStats:
+        """Observable retention/eviction state for one source/symbol."""
+        return self.history.stats(SubscriptionKey(source, symbol))
+
+    def history_stats_snapshot(self) -> dict[SubscriptionKey, HistoryStats]:
+        return self.history.stats_snapshot()
 
     async def unsubscribe(self, subscriber_id: str, source: SourceId, symbol: str) -> SubscriptionResult:
         key = SubscriptionKey(source=source, symbol=symbol)
@@ -298,9 +483,22 @@ class MarketDataFeedService:
             # Release recovered quotes before the gap-resolved marker.
             # Initial or extended gap markers precede future buffered quotes,
             # and those future quotes are not released at this point.
+            if decision.disposition is RecordDisposition.GAP_UNRECOVERABLE:
+                # Everything before the triggering sequence is now an
+                # invalidated region: discard retained history and anchor a
+                # barrier so snapshots can never bridge the hole.
+                self.history.mark_barrier(key, quote.sequence)
+                event_log(
+                    self._logger,
+                    "history_barrier",
+                    key=key,
+                    barrier_sequence=quote.sequence,
+                )
             if decision.release:
                 for released in decision.release:
                     kind = DeliveryKind.QUOTE if decision.disposition is RecordDisposition.ACCEPTED else DeliveryKind.RECOVERED_QUOTE
+                    # Only fully validated, in-order releases enter history.
+                    self.history.record(released)
                     await self._publish_to_key_subscribers(
                         key,
                         self._delivery(kind, released, released.received_time),
@@ -337,6 +535,9 @@ class MarketDataFeedService:
             async with self._key_lock(key):
                 tracker = self._tracker(key)
                 tracker.reset(sequence, event_time)
+                # Fresh region anchor: pre-resume history can never be served
+                # as a contiguous view with post-resume data.
+                self.history.install_baseline(key, sequence)
                 event_log(self._logger, "explicit_gap_resume", key=key, sequence=sequence, event_time=event_time)
                 await self._publish_gaps(
                     key,

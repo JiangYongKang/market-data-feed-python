@@ -25,6 +25,15 @@ class SubscriptionErrorKind(str, Enum):
     INVALID_SUBSCRIBER = "invalid_subscriber"
     ALREADY_SUBSCRIBED = "already_subscribed"
     NOT_SUBSCRIBED = "not_subscribed"
+    RESUME_POSITION_EVICTED = "resume_position_evicted"
+    RESUME_POSITION_AHEAD = "resume_position_ahead"
+    RESUME_BARRIER_PRESENT = "resume_barrier_present"
+    SNAPSHOT_INCOMPLETE = "snapshot_incomplete"
+
+
+class HandoffMode(str, Enum):
+    SNAPSHOT = "snapshot"
+    RESUME = "resume"
 
 
 class RecordDisposition(str, Enum):
@@ -61,6 +70,7 @@ class DeliveryKind(str, Enum):
     SUBSCRIPTION = "subscription"
     DROPPED = "dropped"
     COALESCED = "coalesced"
+    HANDOFF = "handoff"
 
 
 class IngestStatus(str, Enum):

@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 
 from .enums import SourceId
-from .models import SubscriberOptions
+from .models import ResumePosition, SubscriberOptions
 from .schemas import IngestRequest, ReconnectRequest, SubscribeRequest, UnsubscribeRequest
 from .service import MarketDataFeedService
 
@@ -65,21 +65,51 @@ def create_app(service: MarketDataFeedService | None = None) -> FastAPI:
     async def queues() -> dict[str, int]:
         return feed.dispatcher.queue_snapshot()
 
+    @app.get("/state/history/{source}/{symbol}")
+    async def history(source: SourceId, symbol: str) -> dict[str, Any]:
+        stats = feed.history_stats(source, symbol)
+        return _jsonable(stats)
+
     @app.post("/subscriptions")
     async def subscribe(request: SubscribeRequest):
         options = SubscriberOptions(queue_size=request.queue_size, backpressure=request.backpressure)
+        resume_from = (
+            ResumePosition(request.source, request.symbol, request.resume_from_sequence)
+            if request.resume_from_sequence is not None
+            else None
+        )
         result = await feed.subscribe(
             request.subscriber_id,
             request.source,
             request.symbol,
             options,
+            snapshot=request.snapshot,
+            resume_from=resume_from,
+            wait_for_consistency=request.wait_for_consistency,
+            consistency_timeout=request.consistency_timeout,
         )
-        return {
+        response = {
             "ok": result.ok,
             "changed": result.changed,
             "detail": result.detail,
             "kind": result.kind.value if result.kind else None,
         }
+        if result.handoff is not None:
+            envelope = result.handoff
+            response["handoff"] = {
+                "mode": envelope.mode.value,
+                "source": envelope.key.source.value,
+                "symbol": envelope.key.symbol,
+                "resume_from_sequence": envelope.resume_from_sequence,
+                "live_from_sequence": envelope.live_from_sequence,
+                "complete": envelope.complete,
+                "quotes": [
+                    {"sequence": quote.sequence, "record_id": quote.record_id}
+                    for quote in envelope.quotes
+                ],
+                "stats": _jsonable(envelope.stats),
+            }
+        return response
 
     @app.delete("/subscriptions")
     async def unsubscribe(request: UnsubscribeRequest):

@@ -49,3 +49,49 @@ def test_http_unknown_symbol_and_malformed_record_are_distinct():
     event = client.get("/subscribers/web/events").json()
     assert event["kind"] == "rejection"
     assert event["payload"]["reason"] == "invalid_number"
+
+
+def test_http_snapshot_subscribe_and_history_stats_endpoints():
+    client = TestClient(create_app(MarketDataFeedService(history_capacity_per_key=5)))
+    client.post("/subscriptions", json={"subscriber_id": "seed", "source": "source_a", "symbol": "AAA"})
+    for sequence in range(6):
+        client.post("/sources/source_a/ingest", json={"record": record(sequence)})
+
+    history = client.get("/state/history/source_a/AAA").json()
+    assert history["retained_count"] == 5
+    assert history["oldest_sequence"] == 1
+    assert history["newest_sequence"] == 5
+    assert history["evicted_total"] == 1
+
+    response = client.post("/subscriptions", json={
+        "subscriber_id": "late",
+        "source": "source_a",
+        "symbol": "AAA",
+        "snapshot": 3,
+    })
+    body = response.json()
+    assert body["ok"] is True
+    assert body["handoff"]["mode"] == "snapshot"
+    assert [quote["sequence"] for quote in body["handoff"]["quotes"]] == [3, 4, 5]
+    assert body["handoff"]["live_from_sequence"] == 6
+
+    event = client.get("/subscribers/late/events").json()
+    assert event["kind"] == "handoff"
+    assert [quote["sequence"] for quote in event["payload"]["quotes"]] == [3, 4, 5]
+
+
+def test_http_resume_beyond_retention_is_explicit():
+    client = TestClient(create_app(MarketDataFeedService(history_capacity_per_key=2)))
+    client.post("/subscriptions", json={"subscriber_id": "seed", "source": "source_a", "symbol": "AAA"})
+    for sequence in range(5):
+        client.post("/sources/source_a/ingest", json={"record": record(sequence)})
+
+    response = client.post("/subscriptions", json={
+        "subscriber_id": "stale",
+        "source": "source_a",
+        "symbol": "AAA",
+        "resume_from_sequence": 0,
+    })
+    body = response.json()
+    assert body["ok"] is False
+    assert body["kind"] == "resume_position_evicted"

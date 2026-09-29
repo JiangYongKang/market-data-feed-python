@@ -1,6 +1,6 @@
 # Deterministic Multi-Source Market Data Feed
 
-这是一个不依赖外部网络、真实凭据或付费服务的本地实时行情接入与分发服务。服务把结构不同的来源记录归一化为统一模型，对序号、时间、缺口恢复和订阅者背压进行确定性处理，并通过结构化日志打印原始输入、判定结果和依据。
+这是一个不依赖外部网络、真实凭据或付费服务的本地实时行情接入与分发服务。服务把结构不同的来源记录归一化为统一模型，对序号、时间、缺口恢复和订阅者背压进行确定性处理，并通过结构化日志打印原始输入、判定结果和依据。在实时分发之外，它还为“中途接入”的消费方提供**有界历史快照（snapshot）**和**断点续传（resume）**。
 
 ## 1. 支持的行情来源
 
@@ -148,14 +148,91 @@ JSON 对象，字段命名、时间格式、价格表示和空值语义与 Sourc
 
 并发模型遵循 FastAPI/asyncio 的单事件循环语义：多个来源写入任务、多个订阅者读取任务可以并发运行；服务通过来源锁和标的锁保证同一来源/标的的状态转移原子且有序。若从工作线程接入外部组件，应由调用方把 `ingest(...)` 调度回服务所属事件循环，而不是在多个线程中各自创建事件循环共享同一 asyncio 队列。
 
-## 8. HTTP 接口
+## 8. 有界历史快照与断点续传
+
+为了支撑“行情已经跑了一段后才启动”和“崩了以后从上次处理位置接着看”的消费方，服务在实时状态机之外维护一份**每个 `(source, symbol)` 独立、容量有上限、只含已确认行情**的历史（`market_feed.history.HistoryStore`）。
+
+### 8.1 什么数据会进历史
+
+只有**完整通过序号与时间校验、由状态机按序释放**的行情才会写入历史：
+
+- 正常连续行情（`accepted`）与缺口补齐后按序释放的行情（`recovered`）；
+- 乱序（`out_of_order`）、过期（`stale`）、重复（`duplicate`）的行情**不进历史**；
+- 还在缓冲区等补齐的未来行情（`buffered`）**不进历史**，它们尚未成为可用参考；
+- 发生不可恢复缺口时，缺口之前的历史会被整体废弃并落一个**栅栏（barrier）**，快照绝不可能“看起来正常却跨过一个洞”；
+- 调用 `resume_after_gap(...)` 显式安装新水位后，历史以该水位为排他下界重新开始。
+
+### 8.2 保留范围、容量上限与可观测性
+
+- 容量由构造参数 `MarketDataFeedService(history_capacity_per_key=N)` 控制（默认 `64`），按来源/标的各自独立计数；
+- 超出容量的最旧行情被淘汰（evict），内存不会无界增长；
+- 通过 `service.history_stats(source, symbol)`（HTTP：`GET /state/history/{source}/{symbol}`）可观测：
+  - `retained_count`：当前保留条数；`capacity`：上限；
+  - `oldest_sequence` / `newest_sequence`：保留窗口边界；
+  - `evicted_total`：累计淘汰条数（“淘汰到哪”）；
+  - `barrier_sequence`：不可恢复缺口/显式 resume 后有效区域的排他下界；
+- 历史存储本身只用普通锁且全程不 `await`，生成快照只是拷贝一个有界切片，**不会长时间卡住正常写入**。
+
+### 8.3 订阅时要一份快照
+
+在 `subscribe(...)` 上传 `snapshot=<最多回看条数>`：
+
+```python
+result = await service.subscribe(
+    "late-consumer", SourceId.SOURCE_A, "AAA",
+    SubscriberOptions(queue_size=32),
+    snapshot=10,
+)
+envelope = result.handoff          # HandoffEnvelope
+envelope.quotes                    # 最近至多 10 条已确认行情，按序号升序
+envelope.live_from_sequence        # 实时流的第一条序号 = 快照最后一条 + 1
+```
+
+服务先把快照作为一个 `handoff` 投递事件放进该订阅者队列的**最前面**，之后的实时行情排在其后。订阅者读到的顺序是：
+
+1. 一个 `DeliveryKind.HANDOFF` 信封事件，`payload.quotes` 即历史视图；
+2. 从 `live_from_sequence` 开始的正常实时 `quote` / `recovered_quote`。
+
+交界处由服务在该标的的同一把锁内完成“选切片 + 注册订阅 + 入队历史”，因此**既不会重复投，也不会漏投**，订阅方不需要再做一轮去重。
+
+### 8.4 补缺口期间订阅：要么等到一致，要么明确告知不完整
+
+订阅快照/续传时若该标的正处于可恢复缺口的补齐中间，服务**不会**给出一个看似正常的视图，而是：
+
+- 默认立即拒绝，返回 `kind=snapshot_incomplete`（续传同理会被拒），`detail` 给出缺口范围；**不会创建订阅或队列**；
+- 若传入 `wait_for_consistency=True`（可配 `consistency_timeout` 秒），服务会以非阻塞轮询等缺口补齐后再给出前后一致的快照；超时仍未补齐则同样返回 `snapshot_incomplete`，调用方可重试或稍后再订阅。
+
+### 8.5 带进度标记的断点续传
+
+消费端用 `ResumePosition(source, symbol, sequence)` 表示“`sequence`（含）之前我都处理过了”，在 `subscribe(..., resume_from=...)` 时传回：
+
+- 只要该位置仍在保留窗口内且中间没有栅栏，服务就返回严格在该位置**之后**的保留行情，已经处理过的不重发，随后平滑接上实时流（同样以 `handoff` 信封 + 实时流交付）；
+- 以下三种情况服务**绝不静默跳过**，而是明确返回错误并要求调用方“重新拉快照、从头对齐”（此时不创建订阅）：
+  - `resume_position_evicted`：进度标记早于保留窗口，中间的行情已被淘汰；
+  - `resume_position_ahead`：进度标记比保留的最新行情还新（例如连到了另一个实例）；
+  - `resume_barrier_present`：标记与当前数据之间横着一个不可恢复缺口（或发生在显式 resume 之前的旧区域）；
+- 进度标记与订阅的来源/标的不一致也会被拒绝。
+
+边界语义：若保留窗口最旧序号是 `oldest`，则检查点 `oldest - 1` 仍然连续（补发正好从 `oldest` 开始）；再小才判定为淘汰不连续。
+
+### 8.6 与缺口恢复、背压的配合
+
+- 快照/续传历史通过 `Dispatcher.begin_handoff(...)` 进入订阅者队列，受同一个有界 `queue_size` 约束，不会因为历史回放让内存越过队列上限；
+- 历史回放带“不可丢弃”标记：`block` 策略照常等待容量；`drop_oldest` 在交接期间只会丢实时旧事件、绝不丢历史切片，若队列里全是受保护的历史则退化为等待；`coalesce_latest` 在交接完成前暂停合并（历史不能被合并掉）；`reject` 也不会把历史切片切掉，因为那会交出一个不连续的视图；
+- 交接期间入队的实时行情排在历史之后，交接完成前不会与历史发生合并或错序；
+- 历史回放与实时流仍然是**每个来源/标的独立**的，不同来源、不同标的不会串位。
+
+相关结构化日志：`handoff_delivered`（模式、条数、检查点、实时起点）、`history_barrier`（栅栏序号），交接期间的容量等待/降级仍记为 `backpressure_decision`（带 `handoff=true`）。
+
+## 9. HTTP 接口
 
 服务入口为 `main:app`。
 
 - `GET /health`
 - `GET /state/subscriptions`
 - `GET /state/queues`
-- `POST /subscriptions`
+- `GET /state/history/{source}/{symbol}`：查看某个来源/标的的历史保留与淘汰情况
+- `POST /subscriptions`（支持 `snapshot`、`resume_from_sequence`、`wait_for_consistency`、`consistency_timeout`）
 - `DELETE /subscriptions`
 - `POST /sources/{source}/ingest`
 - `POST /sources/{source}/disconnect`
@@ -176,6 +253,24 @@ curl -X POST http://127.0.0.1:8000/subscriptions \
   }'
 ```
 
+中途接入、要最近 5 条已确认行情作为初始视图：
+
+```bash
+curl -X POST http://127.0.0.1:8000/subscriptions \
+  -H 'content-type: application/json' \
+  -d '{"subscriber_id":"late","source":"source_a","symbol":"AAA","snapshot":5}'
+# 响应的 handoff.quotes 是历史切片，handoff.live_from_sequence 是实时起点；
+# 随后 GET /subscribers/late/events 会先收到 kind=handoff 的信封事件。
+```
+
+崩后重启、从“已处理到序号 12”续传；若位置已被淘汰或横有不可恢复缺口，响应 `ok=false` 且 `kind` 为 `resume_position_evicted` / `resume_position_ahead` / `resume_barrier_present`，此时应改为带 `snapshot` 重新订阅对齐：
+
+```bash
+curl -X POST http://127.0.0.1:8000/subscriptions \
+  -H 'content-type: application/json' \
+  -d '{"subscriber_id":"reconnected","source":"source_a","symbol":"AAA","resume_from_sequence":12}'
+```
+
 注入示例：
 
 ```bash
@@ -184,7 +279,7 @@ curl -X POST http://127.0.0.1:8000/sources/source_a/ingest \
   -d '{"record":{"trade_id":"a1","sym":"AAA","seq":1,"ts_ms":1790035201000,"px":"100.25","qty":1}}'
 ```
 
-## 9. 本地验证
+## 10. 本地验证
 
 运行所有测试：
 
@@ -201,7 +296,13 @@ uv run pytest -q
 - 四种背压策略、有界队列及丢弃/合并审计；
 - 多来源并发写入、多订阅者读取、价格/标的不错配；
 - 单个订阅者回调异常隔离；
-- HTTP API 的订阅、注入、重复判定和 Decimal JSON 表示。
+- HTTP API 的订阅、注入、重复判定和 Decimal JSON 表示；
+- 有界历史存储：容量淘汰、按来源/标的隔离、快照尾部、续传补发、栅栏与新基线；
+- **中途订阅先拿快照、再平滑进入实时流（交界处不重不漏）**；
+- **带进度标记重连只补发缺失部分；位置被淘汰/超前/跨越不可恢复缺口时被明确拒绝**；
+- 补缺口中途订阅被明确告知不完整，或等待补齐后给出一致快照（含超时不留订阅）；
+- 不可恢复缺口使旧历史失效，显式 resume 后新区域才可快照；
+- 交接在小容量 + `drop_oldest` 下也不丢历史；订阅与实时写入并发时边界原子、连续。
 
 测试运行时会输出 JSON 结构化日志。关键日志包括：
 
@@ -209,8 +310,10 @@ uv run pytest -q
 - `sequence_decision`：序号、时间、状态和判定依据；
 - `sequence_gap`：缺口范围、状态和恢复序号；
 - `record_rejected`：原始记录和拒绝原因；
-- `backpressure_decision`：丢弃、合并或拒绝审计；
-- `source_disconnected` / `source_reconnected` / `explicit_gap_resume`。
+- `backpressure_decision`：丢弃、合并或拒绝审计；交接期间的容量等待也记此事件并带 `handoff=true`；
+- `source_disconnected` / `source_reconnected` / `explicit_gap_resume`；
+- `handoff_delivered`：快照/续传的模式、历史条数、检查点与实时起点；
+- `history_barrier`：不可恢复缺口后历史失效的栅栏位置。
 
 启动本地服务：
 
