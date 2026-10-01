@@ -185,8 +185,10 @@ class MarketDataFeedService:
 
         # Optionally wait for an in-flight recoverable gap to close before
         # taking the consistent-view decision. Poll without holding the key
-        # lock so normal ingest/recovery is never blocked.
-        if wait_for_consistency:
+        # lock so normal ingest/recovery is never blocked. Only consistency-
+        # dependent (snapshot/resume) requests wait: plain live-only
+        # subscriptions succeed in every gap state.
+        if wants_handoff and wait_for_consistency:
             deadline = asyncio.get_running_loop().time() + max(consistency_timeout, 0.0)
             while True:
                 state = self.sequence_snapshot(key)
@@ -216,7 +218,12 @@ class MarketDataFeedService:
                 return result
 
             state = self.sequence_snapshot(key)
-            if state is not None and state.state is not GapState.NORMAL:
+            # A non-NORMAL gap state only blocks requests that require a
+            # consistent initial view (snapshot/resume). A plain live-only
+            # subscription carries no checkpoint and asks for no history, so
+            # it is accepted exactly as before: it simply follows whatever the
+            # live stream releases next and never gets history backfilled.
+            if wants_handoff and state is not None and state.state is not GapState.NORMAL:
                 kind = (
                     SubscriptionErrorKind.SNAPSHOT_INCOMPLETE
                     if state.state is GapState.RECOVERING

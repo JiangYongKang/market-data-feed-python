@@ -355,3 +355,212 @@ async def test_handoff_boundary_is_atomic_against_concurrent_ingest():
         assert seen == list(range(seen[0], seen[-1] + 1))
     finally:
         await task
+
+
+@pytest.mark.asyncio
+async def test_plain_live_subscription_during_recoverable_gap_is_accepted_and_follows_stream():
+    service = MarketDataFeedService(max_recoverable_gap=5)
+    await service.ingest(SourceId.SOURCE_A, record_a(0))
+    await service.ingest(SourceId.SOURCE_A, record_a(3))  # gap 1,2 -> RECOVERING
+
+    # No snapshot, no resume checkpoint: the request must behave exactly like
+    # the pre-snapshot era and succeed while the gap is still open.
+    result = await service.subscribe(
+        "live",
+        SourceId.SOURCE_A,
+        "AAA",
+        SubscriberOptions(queue_size=16),
+    )
+    assert result.ok
+    assert result.changed is True
+    assert result.handoff is None
+    assert result.kind is None
+    assert "live" in service.subscription_snapshot()
+    assert service.dispatcher.has_subscriber("live")
+
+    # Healing the gap releases the missing sequences as recovered quotes to the
+    # already-connected live subscriber; no historical quote (seq 0) and no
+    # handoff envelope is ever pushed to it.
+    await service.ingest(SourceId.SOURCE_A, record_a(1))
+    await service.ingest(SourceId.SOURCE_A, record_a(2))
+    recovered = [await service.dispatcher.get("live") for _ in range(3)]
+    assert [event.payload.sequence for event in recovered] == [1, 2, 3]
+    assert all(event.kind is DeliveryKind.RECOVERED_QUOTE for event in recovered)
+
+    marker = await service.dispatcher.get("live")
+    assert marker.kind is DeliveryKind.GAP
+    assert marker.payload.state is GapState.NORMAL
+
+    # Once normal, the live stream continues seamlessly.
+    await service.ingest(SourceId.SOURCE_A, record_a(4))
+    live = await service.dispatcher.get("live")
+    assert live.kind is DeliveryKind.QUOTE
+    assert live.payload.sequence == 4
+
+    delivered = [event.payload.sequence for event in recovered] + [live.payload.sequence]
+    assert 0 not in delivered  # history was never backfilled
+    assert delivered == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_plain_live_subscription_during_unrecoverable_gap_is_accepted():
+    service = MarketDataFeedService(max_recoverable_gap=1)
+    for sequence in range(3):
+        await service.ingest(SourceId.SOURCE_A, record_a(sequence))
+    await service.ingest(SourceId.SOURCE_A, record_a(6))  # gap 3,4,5 -> UNRECOVERABLE
+
+    # A live-only subscriber may still attach and waits out realignment.
+    result = await service.subscribe("live", SourceId.SOURCE_A, "AAA")
+    assert result.ok
+    assert result.handoff is None
+
+    # ... while consistency-dependent requests keep the rejection semantics.
+    blocked = await service.subscribe("snappy", SourceId.SOURCE_A, "AAA", snapshot=10)
+    assert blocked.ok is False
+    assert blocked.kind is SubscriptionErrorKind.RESUME_BARRIER_PRESENT
+
+    # After explicit realignment the plain subscriber simply follows new data.
+    await service.resume_after_gap(SourceId.SOURCE_A, "AAA", 6, BASE + timedelta(seconds=6))
+    await service.ingest(SourceId.SOURCE_A, record_a(7))
+    marker = await service.dispatcher.get("live")
+    assert marker.kind is DeliveryKind.GAP
+    quote = await service.dispatcher.get("live")
+    assert quote.kind is DeliveryKind.QUOTE
+    assert quote.payload.sequence == 7
+
+    # And snapshot requests work again on the fresh region.
+    ok = await service.subscribe("snappy", SourceId.SOURCE_A, "AAA", SubscriberOptions(queue_size=8), snapshot=10)
+    assert ok.ok
+    assert [q.sequence for q in ok.handoff.quotes] == [7]
+
+
+@pytest.mark.asyncio
+async def test_handoff_rejection_during_gap_leaves_no_residue_and_retry_succeeds_after_heal():
+    service = MarketDataFeedService(max_recoverable_gap=5)
+    await service.ingest(SourceId.SOURCE_A, record_a(0))
+    await service.ingest(SourceId.SOURCE_A, record_a(3))  # gap 1,2
+
+    refused_snapshot = await service.subscribe("late", SourceId.SOURCE_A, "AAA", snapshot=10)
+    assert refused_snapshot.ok is False
+    assert refused_snapshot.kind is SubscriptionErrorKind.SNAPSHOT_INCOMPLETE
+
+    refused_resume = await service.subscribe(
+        "reconn",
+        SourceId.SOURCE_A,
+        "AAA",
+        resume_from=ResumePosition(SourceId.SOURCE_A, "AAA", 0),
+    )
+    assert refused_resume.ok is False
+    assert refused_resume.kind is SubscriptionErrorKind.SNAPSHOT_INCOMPLETE
+
+    # Clean rejection: neither a registry entry nor a delivery queue remains.
+    assert "late" not in service.subscription_snapshot()
+    assert "reconn" not in service.subscription_snapshot()
+    assert not service.dispatcher.has_subscriber("late")
+    assert not service.dispatcher.has_subscriber("reconn")
+    assert service.dispatcher.queue_snapshot() == {}
+
+    # Heal the gap, then retry with snapshot and with a corrected resume.
+    await service.ingest(SourceId.SOURCE_A, record_a(1))
+    await service.ingest(SourceId.SOURCE_A, record_a(2))
+
+    snapshot_result = await service.subscribe(
+        "late",
+        SourceId.SOURCE_A,
+        "AAA",
+        SubscriberOptions(queue_size=16),
+        snapshot=10,
+    )
+    assert snapshot_result.ok
+    assert [q.sequence for q in snapshot_result.handoff.quotes] == [0, 1, 2, 3]
+    assert snapshot_result.handoff.live_from_sequence == 4
+
+    resume_result = await service.subscribe(
+        "reconn",
+        SourceId.SOURCE_A,
+        "AAA",
+        SubscriberOptions(queue_size=16),
+        resume_from=ResumePosition(SourceId.SOURCE_A, "AAA", 1),
+    )
+    assert resume_result.ok
+    assert [q.sequence for q in resume_result.handoff.quotes] == [2, 3]
+    assert resume_result.handoff.live_from_sequence == 4
+
+
+@pytest.mark.asyncio
+async def test_rejected_handoff_does_not_touch_subscribers_existing_other_subscription():
+    service = MarketDataFeedService(max_recoverable_gap=5)
+    await service.ingest(SourceId.SOURCE_A, record_a(0))
+    await service.ingest(SourceId.SOURCE_A, record_a(3))  # AAA recovering
+
+    # The same subscriber already holds a healthy subscription on BBB.
+    existing = await service.subscribe("multi", SourceId.SOURCE_A, "BBB")
+    assert existing.ok
+
+    refused = await service.subscribe("multi", SourceId.SOURCE_A, "AAA", snapshot=10)
+    assert refused.ok is False
+    assert refused.kind is SubscriptionErrorKind.SNAPSHOT_INCOMPLETE
+
+    keys = {key.symbol for key in service.subscription_snapshot()["multi"]}
+    assert keys == {"BBB"}  # no half-subscription on AAA
+
+    # The pre-existing queue is intact and still receives live traffic.
+    await service.ingest(
+        SourceId.SOURCE_A,
+        record_a(1, symbol="BBB"),
+    )
+    event = await service.dispatcher.get("multi")
+    assert event.kind is DeliveryKind.QUOTE
+    assert event.payload.symbol == "BBB"
+    assert event.payload.sequence == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_heal_and_waiting_snapshot_subscriber_get_contiguous_view():
+    service = MarketDataFeedService(max_recoverable_gap=5, history_capacity_per_key=50)
+    await service.ingest(SourceId.SOURCE_A, record_a(0))
+    await service.ingest(SourceId.SOURCE_A, record_a(3))  # gap 1,2
+
+    # A live-only subscriber attached while the gap is open keeps receiving.
+    await service.subscribe("live", SourceId.SOURCE_A, "AAA", SubscriberOptions(queue_size=64))
+
+    async def heal_and_stream():
+        await asyncio.sleep(0.02)
+        await service.ingest(SourceId.SOURCE_A, record_a(1))
+        await service.ingest(SourceId.SOURCE_A, record_a(2))
+        for sequence in range(4, 12):
+            await service.ingest(SourceId.SOURCE_A, record_a(sequence))
+            await asyncio.sleep(0)
+
+    heal_task = asyncio.create_task(heal_and_stream())
+    try:
+        result = await service.subscribe(
+            "late",
+            SourceId.SOURCE_A,
+            "AAA",
+            SubscriberOptions(queue_size=64),
+            snapshot=100,
+            wait_for_consistency=True,
+            consistency_timeout=2.0,
+        )
+        assert result.ok
+    finally:
+        await heal_task
+
+    boundary = result.handoff.live_from_sequence
+    snapshot_seqs = [q.sequence for q in result.handoff.quotes]
+    assert snapshot_seqs == list(range(snapshot_seqs[0], boundary))
+
+    handoff_event = await service.dispatcher.get("late")
+    assert handoff_event.kind is DeliveryKind.HANDOFF
+
+    # Everything published after the boundary arrives exactly once as live.
+    live_events = [await service.dispatcher.get("late") for _ in range(12 - boundary)]
+    live_seqs = [event.payload.sequence for event in live_events]
+    assert all(event.kind is DeliveryKind.QUOTE for event in live_events)
+    assert live_seqs == list(range(boundary, 12))
+
+    seen = snapshot_seqs + live_seqs
+    assert seen == sorted(set(seen))
+    assert seen == list(range(seen[0], seen[-1] + 1))
+
