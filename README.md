@@ -120,7 +120,7 @@ JSON 对象，字段命名、时间格式、价格表示和空值语义与 Sourc
 6. **缺口扩展**：恢复期间又收到更远的未来记录时，会再次发布 `gap(recovering)`，其中 `missing_sequences` 精确列出当前仍缺失的序号集合。
 7. **缺口恢复**：缺失序号到达后，缓冲记录严格按序号释放，事件类型为 `recovered_quote`，与正常 `quote` 区分。
 8. **恢复完成**：所有恢复行情发布后，再发布 `gap(normal)` 控制事件；其 `recovered_sequences` 只包含实际缺失后找回的序号，不包括一开始就提前到达并缓冲的未来行情。
-9. **超大缺口**：返回并发布 `gap(unrecoverable)`，触发记录不会被混作正常行情；必须调用 `resume_after_gap(...)` 显式安装新水位。
+9. **超大缺口**：返回并发布 `gap(unrecoverable)`，触发记录不会被混作正常行情；必须调用 `resume_after_gap(...)` 显式安装新水位。期间新的**纯实时订阅仍可正常建立**（见 8.4），被挡住的只是快照/续传这类要一致性初始视图的请求。
 
 ## 6. 断连与重连语义
 
@@ -195,12 +195,15 @@ envelope.live_from_sequence        # 实时流的第一条序号 = 快照最后�
 
 交界处由服务在该标的的同一把锁内完成“选切片 + 注册订阅 + 入队历史”，因此**既不会重复投，也不会漏投**，订阅方不需要再做一轮去重。
 
-### 8.4 补缺口期间订阅：要么等到一致，要么明确告知不完整
+### 8.4 补缺口期间订阅：纯实时照常订阅，快照/续传要么等到一致要么明确拒绝
 
-订阅快照/续传时若该标的正处于可恢复缺口的补齐中间，服务**不会**给出一个看似正常的视图，而是：
+缺口（可恢复缺口补齐中，或不可恢复缺口尚未重新对齐）只影响**依赖一致性初始视图**的请求，不影响普通实时订阅：
 
-- 默认立即拒绝，返回 `kind=snapshot_incomplete`（续传同理会被拒），`detail` 给出缺口范围；**不会创建订阅或队列**；
-- 若传入 `wait_for_consistency=True`（可配 `consistency_timeout` 秒），服务会以非阻塞轮询等缺口补齐后再给出前后一致的快照；超时仍未补齐则同样返回 `snapshot_incomplete`，调用方可重试或稍后再订阅。
+- **纯实时订阅（既不传 `snapshot` 也不传 `resume_from`）**：行为与缺口出现前完全一致——任何缺口状态下都正常订阅成功，不被塞历史数据，队列里也不会凭空多出 `handoff` 事件。订阅者从订阅生效的那一刻起顺着实时流往下收：缺口期间会照常收到 `gap` 控制事件，缺口补齐后收到按序释放的 `recovered_quote` 与随后的正常 `quote`；不可恢复缺口下先收到 `gap(unrecoverable)`，调用 `resume_after_gap(...)` 重新对齐后收到 `gap(normal)` 与新区域行情。订阅之前已经发布过的行情不会补发（需要历史的消费方应显式请求快照/续传）。
+- **快照/续传订阅（传了 `snapshot` 或 `resume_from`）**：服务**不会**给出一个看似正常、实际跨过缺口的视图，而是：
+  - 默认立即拒绝，可恢复缺口期间返回 `kind=snapshot_incomplete`，未重新对齐的不可恢复缺口返回 `kind=resume_barrier_present`（续传同理会被拒），`detail` 给出缺口范围；**拒绝是干净的，不会创建订阅或队列，也不会残留半个 handoff**，调用方改成纯实时订阅、或等缺口合上/重新对齐后带快照/续传重试都能正常成功；
+  - 若传入 `wait_for_consistency=True`（可配 `consistency_timeout` 秒），服务会以非阻塞轮询等缺口补齐后再给出前后一致的快照；超时仍未补齐则同样返回 `snapshot_incomplete`（同样不留任何订阅/队列）。该等待只对快照/续传请求生效，纯实时订阅不会被它延迟。
+- 拒绝与重试互不污染：一个订阅者的 handoff 被拒，不影响同标的上已存在的纯实时订阅，也不影响其他订阅者。
 
 ### 8.5 带进度标记的断点续传
 
@@ -301,6 +304,9 @@ uv run pytest -q
 - **中途订阅先拿快照、再平滑进入实时流（交界处不重不漏）**；
 - **带进度标记重连只补发缺失部分；位置被淘汰/超前/跨越不可恢复缺口时被明确拒绝**；
 - 补缺口中途订阅被明确告知不完整，或等待补齐后给出一致快照（含超时不留订阅）；
+- **补缺口/未重新对齐期间，不带快照、不带进度的纯实时订阅照常成功，随后沿实时流收到缺口控制事件、补齐行情与后续正常行情（不可恢复缺口下在 `resume_after_gap` 后恢复）**；
+- **快照/续传在缺口期间被干净拒绝（不残留订阅或队列），缺口合上/重新对齐后重试成功；被拒不影响同标的已有的纯实时订阅**；
+- **缺口边愈合边写入时请求快照，交界处不重不漏、序列连续；缺口前与缺口中加入的实时订阅者都收到一条连续流**；
 - 不可恢复缺口使旧历史失效，显式 resume 后新区域才可快照；
 - 交接在小容量 + `drop_oldest` 下也不丢历史；订阅与实时写入并发时边界原子、连续。
 
@@ -319,4 +325,27 @@ uv run pytest -q
 
 ```bash
 uv run uvicorn main:app --reload
+```
+
+针对“缺口期间订阅语义”的定向验证：
+
+```bash
+# 只跑快照/续传相关用例（含本次新增的缺口期间订阅语义）
+uv run pytest tests/test_snapshot_resume.py -q
+# 全量回归
+uv run pytest -q
+```
+
+也可以用 HTTP 手工复现：先注入 `seq=0`，再注入 `seq=3` 打开可恢复缺口（缺 1、2）；随后分别发起两类订阅：
+
+```bash
+# 1) 纯实时订阅：缺口期间应 ok=true，之后 GET 事件能收到补齐行情
+curl -X POST http://127.0.0.1:8000/subscriptions -H 'content-type: application/json' \
+  -d '{"subscriber_id":"live","source":"source_a","symbol":"AAA"}'
+# 2) 要快照的订阅：缺口期间应 ok=false、kind=snapshot_incomplete
+curl -X POST http://127.0.0.1:8000/subscriptions -H 'content-type: application/json' \
+  -d '{"subscriber_id":"viewer","source":"source_a","symbol":"AAA","snapshot":10}'
+# 此时 GET /state/subscriptions 中不应出现 viewer（拒绝不留订阅）
+curl http://127.0.0.1:8000/state/subscriptions
+# 3) 补进 seq=1、seq=2 后，带快照/续传重试 viewer 应 ok=true 并拿到 handoff
 ```
